@@ -115,6 +115,10 @@
       { id: "a4", type: "medical", text: "יעל טרם השלימה את הטופס הרפואי", done: false },
       { id: "a5", type: "program", text: "התוכנית של דנה לא עודכנה יותר מחודש", done: false },
     ],
+    feedbacks: [
+      { id: "f1", sessionId: "s1", clientId: "c1", sendDate: "2026-11-03", status: "scheduled", sentVia: "WhatsApp", answers: null },
+      { id: "f2", sessionId: "s6", clientId: "c2", sendDate: "2026-10-21", status: "answered", sentVia: "WhatsApp", answers: { workout: 4, difficulty: 4, body: 3 } },
+    ],
     activity: [
       { time: "היום, 09:12", text: "האימון של מיה סומן כבוצע" },
       { time: "שישי, 13:40", text: "מיה אישרה את האימון ביום חמישי" },
@@ -160,6 +164,7 @@
       debt: state.clients.reduce((sum, c) => sum + debt(c), 0),
       collected: state.clients.reduce((sum, c) => sum + c.paid, 0),
       alerts: state.alerts.filter((a) => !a.done).length,
+      feedbackPending: state.feedbacks.filter((f) => f.status !== "answered").length,
     };
   }
   function setSessionStatus(state, sessionId, status) {
@@ -168,8 +173,60 @@
     session.status = status;
     session.charge = ["completed", "late_cancel", "no_show"].includes(status);
     const client = getClient(state, session.clientId);
+    if (status === "completed") scheduleFeedback(state, sessionId);
     state.activity.unshift({ time: "עכשיו", text: `${client.name}: ${statuses[status].label}` });
     return { ok: true, session, client };
+  }
+  function scheduleFeedback(state, sessionId) {
+    const session = getSession(state, sessionId);
+    if (!session || session.status !== "completed") return { ok: false, message: "המשוב נשלח רק אחרי אימון שבוצע" };
+    const existing = state.feedbacks.find((f) => f.sessionId === sessionId);
+    if (existing) return { ok: true, feedback: existing, existing: true };
+    const send = new Date(session.date + "T12:00:00");
+    send.setDate(send.getDate() + 1);
+    const feedback = {
+      id: "f" + (state.feedbacks.length + 1),
+      sessionId,
+      clientId: session.clientId,
+      sendDate: send.toISOString().slice(0, 10),
+      status: "scheduled",
+      sentVia: "WhatsApp",
+      answers: null,
+    };
+    state.feedbacks.push(feedback);
+    return { ok: true, feedback };
+  }
+  function submitFeedback(state, feedbackId, answers) {
+    const feedback = state.feedbacks.find((f) => f.id === feedbackId);
+    if (!feedback) return { ok: false, message: "בקשת המשוב לא נמצאה" };
+    const normalized = { workout: Number(answers.workout), difficulty: Number(answers.difficulty), body: Number(answers.body) };
+    if (Object.values(normalized).some((n) => !Number.isInteger(n) || n < 1 || n > 5)) {
+      return { ok: false, message: "כל תשובה חייבת להיות בין 1 ל־5" };
+    }
+    feedback.answers = normalized;
+    feedback.status = "answered";
+    const client = getClient(state, feedback.clientId);
+    const needsAttention = normalized.body <= 2 || normalized.difficulty === 5 || normalized.workout <= 2;
+    if (needsAttention && !state.alerts.some((a) => a.feedbackId === feedbackId)) {
+      state.alerts.unshift({
+        id: "a" + (state.alerts.length + 1),
+        type: "feedback",
+        feedbackId,
+        text: `${client.name}: משוב האימון דורש בדיקה — אימון ${normalized.workout}/5, קושי ${normalized.difficulty}/5, גוף ${normalized.body}/5`,
+        done: false,
+      });
+    }
+    state.activity.unshift({ time: "עכשיו", text: `${client.name}: התקבל משוב יום־אחרי` });
+    return { ok: true, feedback, needsAttention };
+  }
+  function feedbackForClient(state, clientId) {
+    return state.feedbacks.filter((f) => f.clientId === clientId);
+  }
+  function feedbackMessage(state, feedbackId) {
+    const feedback = state.feedbacks.find((f) => f.id === feedbackId);
+    const client = feedback && getClient(state, feedback.clientId);
+    if (!feedback || !client) return "";
+    return `היי ${client.name.split(" ")[0]} 💚 איך הגוף אחרי האימון? אשמח שתעני על 3 שאלות קצרות בדירוג 1–5.`;
   }
   function addPayment(state, clientId, amount, method) {
     const client = getClient(state, clientId);
@@ -244,6 +301,10 @@
     remainingSessions,
     totals,
     setSessionStatus,
+    scheduleFeedback,
+    submitFeedback,
+    feedbackForClient,
+    feedbackMessage,
     addPayment,
     updatePackagePrice,
     markReceipt,
@@ -256,14 +317,14 @@
   <script>
     (function(){
       const C=window.ShaharCore,state=C.createState();let view='dashboard';
-      const navItems=[['dashboard','סקירה'],['clients','מתאמנים'],['calendar','יומן'],['close','סגירת חודש'],['programs','תוכניות']];
+      const navItems=[['dashboard','סקירה'],['clients','מתאמנים'],['calendar','יומן'],['feedback','משוב יום־אחרי'],['close','סגירת חודש'],['programs','תוכניות']];
       const $=(s,r=document)=>r.querySelector(s);const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
       const money=n=>new Intl.NumberFormat('he-IL').format(n)+' ₪';
       function status(s){const x=C.statuses[s]||C.statuses.planned;const cls=x.tone==='danger'?'danger-tone':x.tone==='muted'?'muted-tone':x.tone;return `<span class="status ${cls}">${x.label}</span>`}
       function setView(v){view=v;renderNav();render();window.scrollTo(0,0)}
       function renderNav(){nav.innerHTML=navItems.map(([id,label])=>`<button data-view="${id}" class="${view===id?'active':''}">${label}</button>`).join('');nav.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>setView(b.dataset.view))}
       function pageHead(kicker,title,sub,button=''){return `<div class="pagehead"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${sub}</p></div>${button}</div>`}
-      function sideRender(){const open=state.alerts.filter(a=>!a.done);side.innerHTML=`<div class="agent-card"><h3>הסוכן של שחר 🎙</h3><p>מעדכן אימונים ותשלומים מתוך הודעה קולית — תמיד מציג את הפעולות לפני שמירה.</p><button class="primary" id="sideAgent">נסי עדכון קולי</button></div><section class="card section"><div class="sectionhead"><h2>דורש תשומת לב</h2><small>${open.length} פתוחים</small></div>${open.slice(0,4).map(a=>`<div class="alert-item"><div class="alert-icon">${a.type==='payment'?'₪':a.type==='medical'?'✚':a.type==='program'?'↻':'◷'}</div><div><p>${esc(a.text)}</p><button class="linkbtn" data-alert="${a.id}">טופל</button></div></div>`).join('')||'<div class="empty">הכול טופל</div>'}</section>`;$('#sideAgent').onclick=agentModal;side.querySelectorAll('[data-alert]').forEach(b=>b.onclick=()=>{C.completeAlert(state,b.dataset.alert);sideRender()})}
+      function sideRender(){const open=state.alerts.filter(a=>!a.done);side.innerHTML=`<div class="agent-card"><h3>הסוכן של שחר 🎙</h3><p>מעדכן אימונים ותשלומים מתוך הודעה קולית — תמיד מציג את הפעולות לפני שמירה.</p><button class="primary" id="sideAgent">נסי עדכון קולי</button></div><section class="card section"><div class="sectionhead"><h2>דורש תשומת לב</h2><small>${open.length} פתוחים</small></div>${open.slice(0,4).map(a=>`<div class="alert-item"><div class="alert-icon">${a.type==='payment'?'₪':a.type==='medical'?'✚':a.type==='program'?'↻':a.type==='feedback'?'♥':'◷'}</div><div><p>${esc(a.text)}</p><button class="linkbtn" data-alert="${a.id}">טופל</button></div></div>`).join('')||'<div class="empty">הכול טופל</div>'}</section>`;$('#sideAgent').onclick=agentModal;side.querySelectorAll('[data-alert]').forEach(b=>b.onclick=()=>{C.completeAlert(state,b.dataset.alert);sideRender()})}
       function dashboard(){const t=C.totals(state),today=state.sessions.filter(s=>s.date==='2026-11-02');return pageHead('בוקר טוב, שחר','העסק שלך במבט אחד','יום שני, 2 בנובמבר · השבוע כבר בתנועה','<button class="primary" id="newSession">+ קביעת אימון</button>')+`<div class="grid stats"><div class="card stat"><span>מתאמנים פעילים</span><strong>${t.clients}</strong><small>כולם בטיפול אישי</small></div><div class="card stat"><span>אימונים השבוע</span><strong>${t.weekSessions}</strong><small>${t.awaiting} עדיין דורשים אישור</small></div><div class="card stat"><span>יתרה לגבייה</span><strong>${money(t.debt)}</strong><small>משני מתאמנים</small></div><div class="card stat"><span>התראות פתוחות</span><strong>${t.alerts}</strong><small>הסוכן מרכז עבורך</small></div></div><div class="grid two"><section class="card section"><div class="sectionhead"><h2>האימונים הקרובים</h2><button class="linkbtn" data-go="calendar">ליומן המלא</button></div>${state.sessions.filter(s=>s.date>='2026-11-02').slice(0,5).map(sessionRow).join('')}</section><section class="card section"><div class="sectionhead"><h2>מצב המתאמנים</h2><button class="linkbtn" data-go="clients">לכולם</button></div>${state.clients.map(clientMini).join('')}</section></div><section class="card section" style="margin-top:14px"><div class="sectionhead"><h2>פעילות אחרונה</h2><small>יומן שינויים</small></div>${state.activity.slice(0,5).map(a=>`<div class="alert-item"><div class="alert-icon">✓</div><div><p>${esc(a.text)}</p><small>${a.time}</small></div></div>`).join('')}</section>`}
       function sessionRow(s){const c=C.getClient(state,s.clientId);return `<div class="session"><div class="time">${s.time}</div><div><strong>${esc(c.name)}</strong><small>${s.title} · ${formatDate(s.date)}</small></div>${status(s.status)}</div>`}
       function clientMini(c){const rem=C.remainingSessions(state,c.id),d=C.debt(c);return `<div class="client-mini"><div class="avatar">${c.name[0]}</div><div><strong>${esc(c.name)}</strong><small>${esc(c.packageName)} · ${rem} נותרו</small><div class="progress"><i style="width:${Math.max(8,rem/c.packageSize*100)}%"></i></div></div><div class="money ${d?'debt':''}">${d?money(d):'שולם'}</div></div>`}
@@ -272,9 +333,11 @@
       function calendar(){const days=[['ב׳','02.11'],['ג׳','03.11'],['ד׳','04.11'],['ה׳','05.11'],['ו׳','06.11'],['ש׳','07.11'],['א׳','08.11']];return pageHead('תכנון שבועי','יומן האימונים','קבועים, גמישים ואישורי הגעה — עם משמעות ברורה לחיוב','<button class="primary" id="newSession">+ אימון חדש</button>')+`<section class="calendar">${days.map((d,i)=>{const date='2026-11-'+String(2+i).padStart(2,'0'),items=state.sessions.filter(s=>s.date===date);return `<div class="day ${i===0?'today':''}"><div class="dayhead"><strong>${d[0]}</strong><span>${d[1]}</span></div>${items.map(s=>eventCard(s)).join('')||'<div class="empty">פנוי</div>'}</div>`}).join('')}</section><section class="card section" style="margin-top:15px"><div class="sectionhead"><h2>כלל החיוב</h2><small>מופעל אוטומטית בדמו</small></div><div class="note">לפני אישור המועד בעקבות הודעת יום שישי אפשר לבטל ללא חיוב. אחרי שהמועד אושר, ביטול או אי־הגעה מחויבים ומנוכים מהמנוי.</div></section>`}
       function eventCard(s){const c=C.getClient(state,s.clientId),cls=['late_cancel','no_show'].includes(s.status)?'danger-event':s.status==='awaiting'?'warn-event':'';return `<div class="event ${cls}" data-session="${s.id}"><strong>${s.time} · ${esc(c.name)}</strong><small>${C.statuses[s.status].label}</small></div>`}
       function closeMonth(){const t=C.totals(state);return pageHead('נובמבר 2026','סגירת חודש','כמה בוצע, כמה שולם וכמה כל אחד עדיין חייב','<button class="primary" id="closeHelp">הסוכן, מי חייב לי?</button>')+`<div class="grid stats"><div class="card stat"><span>הכנסות שנרשמו</span><strong>${money(t.collected)}</strong><small>מזומן · Bit · העברה</small></div><div class="card stat"><span>יתרה פתוחה</span><strong>${money(t.debt)}</strong><small>ממתינה לגבייה</small></div><div class="card stat"><span>אימונים מחויבים</span><strong>${state.sessions.filter(s=>s.charge).length}</strong><small>כולל ביטול מחויב</small></div><div class="card stat"><span>קבלות לטיפול</span><strong>${state.clients.filter(c=>c.receipt!=='הופקה').length}</strong><small>דרך Paperless</small></div></div><section class="card section"><div class="sectionhead"><h2>פירוט לפי מתאמן</h2><small>נתוני דמו</small></div><div class="tablewrap"><table class="table"><thead><tr><th>מתאמן</th><th>מסלול</th><th>מחיר</th><th>שולם</th><th>יתרה</th><th>אמצעי</th><th>קבלה</th><th></th></tr></thead><tbody>${state.clients.map(c=>`<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.packageName)}</td><td>${money(c.packagePrice)}</td><td>${money(c.paid)}</td><td class="money ${C.debt(c)?'debt':''}">${money(C.debt(c))}</td><td>${esc(c.paymentMethod)}</td><td>${esc(c.receipt)}</td><td><button class="linkbtn" data-payment="${c.id}">רישום תשלום</button><button class="linkbtn" data-receipt="${c.id}">קבלה</button></td></tr>`).join('')}</tbody></table></div></section>`}
+      function feedbackView(){const answered=state.feedbacks.filter(f=>f.status==='answered'),pending=state.feedbacks.filter(f=>f.status!=='answered');return pageHead('אוטומציה אחרי אימון','משוב יום־אחרי','יום אחרי כל אימון שבוצע נשלחת הודעה עם 3 שאלות בדירוג 1–5','<button class="primary" id="previewFeedback">תצוגת טופס למתאמנת</button>')+`<div class="grid stats"><div class="card stat"><span>ממתינים לשליחה/מענה</span><strong>${pending.length}</strong><small>נשלח רק אחרי אימון שבוצע</small></div><div class="card stat"><span>משובים שהתקבלו</span><strong>${answered.length}</strong><small>נשמרים בכרטיס המתאמנת</small></div><div class="card stat"><span>דורשים בדיקה</span><strong>${state.alerts.filter(a=>a.type==='feedback'&&!a.done).length}</strong><small>גוף 1–2 או קושי 5</small></div><div class="card stat"><span>מספר שאלות</span><strong>3</strong><small>פחות מדקה למענה</small></div></div><div class="grid two"><section class="card section"><div class="sectionhead"><h2>תור שליחה</h2><small>הדמיית WhatsApp</small></div>${pending.map(f=>feedbackRow(f)).join('')||'<div class="empty">אין הודעות ממתינות</div>'}</section><section class="card section"><div class="sectionhead"><h2>משובים אחרונים</h2><small>1–5</small></div>${answered.map(f=>feedbackRow(f)).join('')||'<div class="empty">עדיין לא התקבל משוב</div>'}</section></div><section class="card section" style="margin-top:15px"><div class="sectionhead"><h2>נוסח ההודעה</h2><small>נשלחת יום לאחר האימון</small></div><div class="note">היי מיה 💚 איך הגוף אחרי האימון? אשמח שתעני על 3 שאלות קצרות בדירוג 1–5: איך היה האימון, רמת הקושי שהרגשת, ואיך הגוף מרגיש היום?</div></section>`}
+      function feedbackRow(f){const c=C.getClient(state,f.clientId),a=f.answers;return `<div class="session"><div class="time">${formatDate(f.sendDate)}</div><div><strong>${esc(c.name)}</strong><small>${f.status==='answered'?`אימון ${a.workout}/5 · קושי ${a.difficulty}/5 · גוף ${a.body}/5`:'מתוזמן ליום שאחרי האימון'}</small></div><button class="linkbtn" data-feedback="${f.id}">${f.status==='answered'?'צפייה':'תצוגת הודעה'}</button></div>`}
       function programs(){return pageHead('Hevy Coach + המערכת','תוכניות אימון','התוכנית נשמרת ב־Hevy; כאן מנהלים גרסה, תוקף ושירות','<a class="primary" href="https://app.hevycoach.com/" target="_blank" style="text-decoration:none">פתיחת Hevy Coach ↗</a>')+`<div class="grid program-grid">${state.clients.map(c=>`<article class="card program"><span class="tag">${c.packageSize===1?'חד־פעמית':'מתאמנת קבועה'}</span><h3>${esc(c.program)}</h3><p><strong>${esc(c.name)}</strong><br>עודכנה: ${formatDate(c.programUpdated)}<br>${c.packageSize===1?'כוללת אימון הדרכה אחד, ללא מעקב':'עדכון מומלץ בערך אחת לחודש'}</p><div class="program-footer"><a class="primary" href="${c.hevyUrl}" target="_blank">פתיחה ב־Hevy</a><button class="soft" data-client="${c.id}">פרטי מתאמנת</button></div></article>`).join('')}</div>`}
-      function render(){content.innerHTML=view==='dashboard'?dashboard():view==='clients'?clients():view==='calendar'?calendar():view==='close'?closeMonth():programs();wire();sideRender()}
-      function wire(){content.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>setView(b.dataset.go));content.querySelectorAll('[data-client]').forEach(b=>b.onclick=()=>clientModal(b.dataset.client));content.querySelectorAll('[data-session]').forEach(b=>b.onclick=()=>sessionModal(b.dataset.session));content.querySelectorAll('[data-payment]').forEach(b=>b.onclick=()=>paymentModal(b.dataset.payment));content.querySelectorAll('[data-receipt]').forEach(b=>b.onclick=()=>{C.markReceipt(state,b.dataset.receipt);render()});const ns=$('#newSession');if(ns)ns.onclick=newSessionModal;const si=$('#sendIntake');if(si)si.onclick=()=>intakeModal('c3');const ch=$('#closeHelp');if(ch)ch.onclick=()=>agentModal('מי חייב לי כסף?');const cs=$('#clientSearch');if(cs)cs.oninput=()=>{const q=cs.value.trim();content.querySelectorAll('[data-name]').forEach(el=>el.style.display=el.dataset.name.includes(q)?'block':'none')}}
+      function render(){content.innerHTML=view==='dashboard'?dashboard():view==='clients'?clients():view==='calendar'?calendar():view==='feedback'?feedbackView():view==='close'?closeMonth():programs();wire();sideRender()}
+      function wire(){content.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>setView(b.dataset.go));content.querySelectorAll('[data-client]').forEach(b=>b.onclick=()=>clientModal(b.dataset.client));content.querySelectorAll('[data-session]').forEach(b=>b.onclick=()=>sessionModal(b.dataset.session));content.querySelectorAll('[data-payment]').forEach(b=>b.onclick=()=>paymentModal(b.dataset.payment));content.querySelectorAll('[data-receipt]').forEach(b=>b.onclick=()=>{C.markReceipt(state,b.dataset.receipt);render()});content.querySelectorAll('[data-feedback]').forEach(b=>b.onclick=()=>feedbackModal(b.dataset.feedback));const ns=$('#newSession');if(ns)ns.onclick=newSessionModal;const si=$('#sendIntake');if(si)si.onclick=()=>intakeModal('c3');const ch=$('#closeHelp');if(ch)ch.onclick=()=>agentModal('מי חייב לי כסף?');const pf=$('#previewFeedback');if(pf)pf.onclick=()=>feedbackModal('f1');const cs=$('#clientSearch');if(cs)cs.oninput=()=>{const q=cs.value.trim();content.querySelectorAll('[data-name]').forEach(el=>el.style.display=el.dataset.name.includes(q)?'block':'none')}}
       function openModal(html,large=false){modal.className='modal'+(large?' large':'');modal.innerHTML=html;modalBack.classList.add('open');const c=$('[data-close]',modal);if(c)c.onclick=closeModal}
       function closeModal(){modalBack.classList.remove('open')}
       modalBack.onclick=e=>{if(e.target===modalBack)closeModal()};
@@ -285,10 +348,11 @@
       function sessionModal(id){const s=C.getSession(state,id),c=C.getClient(state,s.clientId);openModal(modalHead('אימון — '+c.name)+`<div class="modal-body"><div class="detail-grid"><div class="detail-box"><small>מועד</small><strong>${formatDate(s.date)} · ${s.time}</strong></div><div class="detail-box"><small>סטטוס נוכחי</small><strong>${C.statuses[s.status].label}</strong></div></div><h3>עדכון סטטוס</h3><div class="quickq">${Object.entries(C.statuses).map(([k,v])=>`<button data-new-status="${k}">${v.label}</button>`).join('')}</div><div class="note" style="margin-top:16px">סטטוס „בוצע”, „ביטול מחויב” או „לא הגיע” ינכה אימון מהמנוי.</div></div>`);modal.querySelectorAll('[data-new-status]').forEach(b=>b.onclick=()=>{C.setSessionStatus(state,id,b.dataset.newStatus);closeModal();render()})}
       function newSessionModal(){openModal(modalHead('קביעת אימון חדש')+`<div class="modal-body"><div class="form-grid"><div class="field"><label>מתאמנת</label><select id="newClient">${state.clients.map(c=>`<option value="${c.id}">${c.name}</option>`).join('')}</select></div><div class="field"><label>תאריך</label><input type="date" value="2026-11-08"></div><div class="field"><label>שעה</label><input type="time" value="18:00"></div><div class="field"><label>סטטוס</label><select><option>ממתין לאישור</option><option>מאושר</option></select></div></div><div class="modal-actions"><button class="primary" id="demoSaveSession">שמירת אימון</button></div></div>`);$('#demoSaveSession').onclick=()=>{alert('בדמו המלא האימון יתווסף ליומן.');closeModal()}}
       function intakeModal(id){const c=C.getClient(state,id);openModal(modalHead('טופס קליטה רפואי — '+c.name)+`<div class="modal-body"><div class="note">קישור אישי לדוגמה: shahar-fit.example/intake/${c.id.toUpperCase()} · בדמו אין שליחה או שמירת מידע אמיתי.</div><div class="form-grid" style="margin-top:16px"><div class="field"><label>שם מלא</label><input value="${esc(c.name)}"></div><div class="field"><label>תאריך לידה</label><input type="date" value="${c.birthDate}"></div><div class="field full"><label>מצב רפואי, פציעות או מגבלות</label><textarea rows="3">${esc(c.medical)}</textarea></div><div class="field full"><label>מטרות האימון</label><textarea rows="2">${esc(c.goals)}</textarea></div></div><div class="modal-actions"><button class="primary" id="copyIntake">העתקת קישור</button><button class="soft" data-close>סגירה</button></div></div>`,true);$('#copyIntake').onclick=()=>alert('הקישור הועתק — הדמיה בלבד')}
+      function feedbackModal(id){const f=state.feedbacks.find(x=>x.id===id),c=f&&C.getClient(state,f.clientId);if(!f||!c)return;const a=f.answers;openModal(modalHead('משוב יום־אחרי — '+c.name)+`<div class="modal-body"><div class="note"><strong>הודעה אוטומטית:</strong><br>${esc(C.feedbackMessage(state,id))}<br><small>בדמו ההודעה והשליחה הן הדמיה בלבד.</small></div>${a?`<div class="detail-grid" style="margin-top:16px"><div class="detail-box"><small>איך היה האימון?</small><strong>${a.workout}/5</strong></div><div class="detail-box"><small>רמת הקושי</small><strong>${a.difficulty}/5</strong></div><div class="detail-box"><small>איך הגוף מרגיש היום?</small><strong>${a.body}/5</strong></div></div>`:`<div class="form-grid" style="margin-top:18px"><div class="field full"><label>1. איך היה האימון? · 1 לא טוב, 5 מצוין</label><select id="fbWorkout"><option value="1">1 — לא טוב</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5" selected>5 — מצוין</option></select></div><div class="field full"><label>2. רמת הקושי שהרגשת · 1 קל מאוד, 5 קשה מאוד</label><select id="fbDifficulty"><option value="1">1 — קל מאוד</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option><option value="5">5 — קשה מאוד</option></select></div><div class="field full"><label>3. איך הגוף מרגיש היום? · 1 לא טוב, 5 מצוין</label><select id="fbBody"><option value="1">1 — לא טוב</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5 — מצוין</option></select></div></div><div class="modal-actions"><button class="primary" id="submitFeedback">שליחת המשוב</button></div>`}</div>`,true);const submit=$('#submitFeedback');if(submit)submit.onclick=()=>{const r=C.submitFeedback(state,id,{workout:$('#fbWorkout').value,difficulty:$('#fbDifficulty').value,body:$('#fbBody').value});if(r.ok){alert(r.needsAttention?'המשוב נשמר ושחר קיבלה התראה לבדיקה':'המשוב נשמר — תודה!');closeModal();render()}}}
       function agentModal(autoQuestion){openModal(modalHead('הסוכן של שחר')+`<div class="modal-body"><div class="chat" id="chat"><div class="bubble bot">היי שחר, אפשר להקליט לי שינוי ביומן, תשלום או שאלה על העסק.</div></div><div class="voice"><button id="voiceDemo">🎙</button><div><strong>לחצי להפעלת הקלטת דמו</strong><br><span>הדמו ישמיע תרחיש מוכן ויציג את הפעולות לפני שמירה</span></div></div><div class="quickq"><button data-q="מי חייב לי כסף?">מי חייב לי כסף?</button><button data-q="מי עדיין לא אישר השבוע?">מי לא אישר?</button><button data-q="איזו תוכנית צריך לעדכן?">תוכניות לעדכון</button><button data-q="מי לא מילאה טופס רפואי?">טפסים רפואיים</button></div></div>`);const chat=$('#chat');function ask(q){chat.insertAdjacentHTML('beforeend',`<div class="bubble user">${esc(q)}</div><div class="bubble bot">${esc(C.answerAgent(state,q))}</div>`);chat.scrollTop=chat.scrollHeight}modal.querySelectorAll('[data-q]').forEach(b=>b.onclick=()=>ask(b.dataset.q));$('#voiceDemo').onclick=()=>{const preview='דנה אישרה את האימון למחר בשבע ושילמה עכשיו את יתרת 350 השקלים בביט.';chat.insertAdjacentHTML('beforeend',`<div class="bubble user">🎙 ${preview}</div><div class="bubble bot"><strong>זיהיתי 3 פעולות:</strong><br>1. אישור האימון של דנה<br>2. רישום תשלום 350 ₪ ב־Bit<br>3. סגירת החוב<br><button class="primary" id="confirmVoice" style="margin-top:9px">אישור ועדכון</button></div>`);$('#confirmVoice').onclick=()=>{const r=C.applyVoiceDemo(state);chat.insertAdjacentHTML('beforeend',`<div class="bubble bot">עודכן ✓<br>${r.actions.map(esc).join('<br>')}</div>`);renderNav();sideRender()}};if(autoQuestion)setTimeout(()=>ask(autoQuestion),0)}
       function formatDate(d){return new Date(d+'T12:00:00').toLocaleDateString('he-IL',{day:'2-digit',month:'2-digit'})}
       $('#openAgent').onclick=agentModal;renderNav();render();
-      window.__SHAHAR_DEMO__={state,setView,render,clientModal,sessionModal,paymentModal,intakeModal,agentModal,newSessionModal};
+      window.__SHAHAR_DEMO__={state,setView,render,clientModal,sessionModal,paymentModal,intakeModal,feedbackModal,agentModal,newSessionModal};
     })();
   </script>
 </body>
